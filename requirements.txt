@@ -1,0 +1,29 @@
+# --- Telegram bot ---
+aiogram==3.13.1
+python-dotenv==1.0.1     # чтение токена из файла .env
+
+# --- Базовая работа с изображениями ---
+numpy==1.26.4            # basicsr/realesrgan собраны под numpy<2, ставим 1.x
+opencv-python==4.10.0.84
+Pillow==10.4.0
+
+# --- Torch (CPU). Ставить CPU-колёса, см. README ---
+torch==2.1.2
+torchvision==0.16.2      # 0.16.x ещё содержит functional_tensor, который импортирует basicsr
+
+# --- Реставрация лиц + апскейл ---
+basicsr==1.4.2
+facexlib==0.3.0
+gfpgan==1.3.8
+realesrgan==0.3.0
+
+# --- Раскрашивание (DDColor через modelscope) ---
+modelscope==1.18.0
+datasets<3               # требуется modelscope для импорта пайплайнов (2.x совместима)
+# modelscope подгружает эти зависимости лениво — ставим заранее:
+oss2
+addict
+simplejson
+sortedcontainers
+einops
+timm<1.0                 # бэкбон ConvNeXt для DDColor; в timm 1.0 убран timm.models.layers
