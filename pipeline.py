@@ -44,6 +44,8 @@ class RestorePipeline:
             img = self._stage(self._restore_faces, img, name="face_restore")
         if config.ENABLE_COLORIZE:
             img = self._stage(self._colorize, img, name="colorize")
+        if config.ENABLE_AUTO_WHITE_BALANCE:
+            img = self._stage(self._auto_white_balance, img, name="white_balance")
         if config.ENABLE_UPSCALE:
             img = self._stage(self._upscale, img, name="upscale")
 
@@ -141,6 +143,27 @@ class RestorePipeline:
                 device="cpu",
             )
         return self._colorizer
+
+    # ------------------------------------------------------------------ #
+    # Постобработка: авто-баланс белого ("серый мир").
+    # Предполагаем, что средний цвет сцены должен быть нейтрально-серым,
+    # и масштабируем каналы так, чтобы убрать общий цветовой сдвиг.
+    # Модели не требует — чистый numpy.
+    # ------------------------------------------------------------------ #
+    def _auto_white_balance(self, img):
+        strength = config.AUTO_WHITE_BALANCE_STRENGTH
+        if strength <= 0.001:
+            return img
+
+        f = img.astype(np.float32)
+        means = f.reshape(-1, 3).mean(axis=0)          # средние по каналам [B, G, R]
+        gray = float(means.mean())
+        scales = gray / np.clip(means, 1e-6, None)     # коэффициенты к серому
+        corrected = f * scales                         # broadcast по каналам
+
+        # Смешиваем с оригиналом по силе, чтобы коррекцию можно было ослабить.
+        out = f * (1.0 - strength) + corrected * strength
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     # ------------------------------------------------------------------ #
     # Стадия 3: апскейл (Real-ESRGAN x2).
