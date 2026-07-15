@@ -1,85 +1,143 @@
-# Photo Restore Bot
+# Photo Colorize Bot
 
-Telegram-бот, который реставрирует чёрно-белые фото, раскрашивает их и повышает
-качество. Работает локально на CPU (ноутбук без видеокарты). Все модели — open
-source.
+A Telegram bot that colourises old black-and-white photographs, restores faces, and
+upscales the result. Runs on CPU. All models are open source and permissively
+licensed, so the bot may be used commercially.
 
-## Пайплайн
+## Pipeline
 
 ```
-фото → реставрация лиц (GFPGAN) → раскрашивание (DDColor) → апскейл ×2 (Real-ESRGAN) → результат
+original (full resolution)
+  → desaturate      strip a sepia/toned cast, keep luminance
+  → colourise       DDColor predicts Lab chroma at 512×512
+  → white balance   shades-of-grey
+  → restore faces   YuNet finds them, RestoreFormer++ repairs them
+  → upscale         Real-ESRGAN ×2, only for small photos
 ```
 
-| Стадия | Модель | Лицензия |
+Two design decisions are worth knowing about, because they are not obvious.
+
+**Luminance is never resampled.** DDColor is an `L → ab` model: it predicts only the
+two Lab chroma channels and never reproduces brightness. So the original
+full-resolution luminance is kept exactly as scanned, and only the model's `ab` — which
+is low-frequency and survives it — is upsampled onto it. A 2000 px scan keeps its own
+grain and sharpness. (The previous version shrank every input to 768 px before
+colourising, then leaned on Real-ESRGAN to hallucinate the lost detail back.)
+
+**Faces are restored after colourising, not before.** Face restorers are trained on
+colour faces. Feeding one a greyscale image puts it outside its training distribution,
+which is what produces the glassy, over-contrasted eyes that generative restorers are
+notorious for. Colourising first keeps the restorer in-distribution.
+
+| Stage | Model | Licence |
 |---|---|---|
-| Реставрация лиц | GFPGAN | Apache-2.0 |
-| Раскрашивание | DDColor (через modelscope) | Apache-2.0 |
-| Апскейл | Real-ESRGAN x2plus | BSD-3 |
+| Colourise | DDColor | Apache-2.0 |
+| Face detection | YuNet (bundled in OpenCV) | Apache-2.0 |
+| Face restoration | RestoreFormer++ | Apache-2.0 |
+| Upscale | Real-ESRGAN x2plus | BSD-3 |
 
-## Установка
+CodeFormer and GPEN are better known but are licensed for non-commercial use only
+(S-Lab 1.0), which rules them out here.
 
-Нужен Python 3.9–3.10 (под него собраны `basicsr`/`realesrgan`).
+## Architecture
 
-```bash
-cd photo-restore-bot
-python -m venv .venv
-source .venv/bin/activate           # Windows: .venv\Scripts\activate
+The models run as **ONNX**, exported ahead of time. The running bot never imports
+torch — that boundary is the point of the design.
 
-# 1) Torch строго CPU-версия:
-pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cpu
-
-# 2) Остальное:
-pip install -r requirements.txt
+```
+tools/export_onnx.py   the ONLY file allowed to import torch; build-time only
+    ↓ produces
+onnx/*.onnx
+    ↓ consumed by
+models.py     ONNX sessions: threads, lazy loading, eviction
+imaging.py    pure ndarray → ndarray operations; no models, no I/O
+pipeline.py   stage orchestration
+bot.py        Telegram transport
 ```
 
-## Запуск
+Dropping torch took an entire pin cascade with it — `numpy<2`, `timm<1.0`,
+`datasets<3`, `torchvision==0.16.2` and a Python 3.10 ceiling. That is what lets the
+bot be installed next to another service without fighting it over versions.
+
+`imaging.py` holds no models on purpose: the stages are pure functions, so they are
+testable without weights and the pipeline's behaviour can be compared by swapping an
+argument.
+
+## Setup
+
+Python 3.11+.
 
 ```bash
-export BOT_TOKEN="ВАШ_ТОКЕН_ОТ_BOTFATHER"   # Windows: set BOT_TOKEN=...
+python -m venv .venv
+.venv/Scripts/activate          # Linux/macOS: source .venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env            # then put your @BotFather token in it
 python bot.py
 ```
 
-При **первом** запуске нужен интернет: GFPGAN, его детектор лиц (facexlib),
-Real-ESRGAN и DDColor скачают веса в кэш. Дальше всё работает офлайн.
+This needs the exported models in `onnx/`. To produce them, see below.
 
-Откройте бота в Telegram, нажмите /start и пришлите фото. Лучше отправлять
-**как файл (документ)** — Telegram не сожмёт его, и результат будет чётче.
+## Exporting the models
 
-## Производительность
+Done once. It needs torch, which is why it lives in a separate environment — nothing
+here is installed in production.
 
-- Ожидаемое время: ~20–90 секунд на фото на обычном ноутбучном CPU.
-- Память: при 8 ГБ ОЗУ держите `MAX_INPUT_SIDE = 768` и `REALESRGAN_TILE = 256`
-  в `config.py`. Если ловите нехватку памяти — поставьте
-  `SEQUENTIAL_MODEL_LOADING = True` (модели грузятся/выгружаются по стадиям).
-- CPU обрабатывает одно фото за раз (`MAX_CONCURRENT_JOBS = 1`). Запросы других
-  пользователей спокойно ждут в очереди — бот при этом не зависает.
+```bash
+python -m venv .venv-export
+.venv-export/Scripts/pip install -r requirements-export.txt
 
-## Настройки
+git clone --depth 1 https://github.com/piddnad/DDColor.git vendor_repos/DDColor
+git clone --depth 1 https://github.com/wzhouxiff/RestoreFormerPlusPlus.git vendor_repos/RestoreFormerPlusPlus
 
-Всё в `config.py`: размер входа, коэффициент апскейла, тайлинг, включение/
-выключение отдельных стадий, режим экономии памяти.
+# weights → weights/ : RealESRGAN_x2plus.pth, RestoreFormer++.ckpt,
+#                      ddcolor_paper_tiny.pth, ddcolor_modelscope.pth
+# detector → onnx/face_detection_yunet.onnx (from opencv_zoo; no export needed)
 
-## Лицензии моделей — важно
+python -m tools.export_onnx --weights-dir weights --out-dir onnx --repos-dir vendor_repos
+```
 
-`GFPGAN`, `DDColor`, `Real-ESRGAN` пригодны в том числе для коммерческого
-использования. Если захотите заменить реставратор лиц на **CodeFormer** (качество
-по лицам выше) — учтите, что у него лицензия S-Lab 1.0, **только некоммерческое**
-использование.
+Every export is checked against the original torch model and is **discarded if it
+does not reproduce it** within 0.1% of the output range — a silently wrong model
+would be far worse than a failed build.
 
-## Куда расти: ONNX Runtime
+## Performance and memory
 
-Сейчас стадии работают на PyTorch в CPU-режиме — это надёжно и сразу
-запускается. Для ускорения каждую стадию можно перевести на `onnxruntime` (CPU
-EP) без изменения остального кода: внутри `pipeline.py` методы `_restore_faces`,
-`_colorize`, `_upscale` изолированы, поэтому достаточно подменить реализацию
-конкретной стадии на инференс ONNX-модели. Начинать стоит с Real-ESRGAN и
-DDColor (у них простой препроцессинг); GFPGAN сложнее из-за детекции и
-выравнивания лиц.
+Measured on 2 CPU threads:
 
-## Возможные проблемы установки
+| Stage | Time | Peak RAM |
+|---|---|---|
+| Colourise (DDColor large) | ~6 s | ~1.0 GB |
+| Colourise (DDColor tiny) | ~3 s | ~0.3 GB |
+| Restore faces | ~6 s | ~0.4 GB |
+| Upscale | ~27 s **per megapixel of output** | ~0.3 GB |
 
-- `ModuleNotFoundError: torchvision.transforms.functional_tensor` —
-  установлена слишком новая `torchvision`. Зафиксируйте `torchvision==0.16.2`
-  (как в инструкции выше): в ней этот модуль ещё есть, и `basicsr` стартует.
-- Ошибки на numpy 2.x — оставайтесь на `numpy==1.26.4`.
-- `basicsr`/`realesrgan` не ставятся на Python 3.11+ — используйте 3.10.
+Two things follow, and both are load-bearing:
+
+**`enable_cpu_mem_arena = False`** in `models.py`. onnxruntime's arena allocator
+reserves memory far beyond what the graph needs and dominates peak usage — it cost
+DDColor-large 2.3 GB instead of 1.0 GB. Without that one line the large model does
+not fit on a small server at all.
+
+**Upscaling is conditional.** At ~27 s per output megapixel, upscaling a large scan
+would take minutes and blow through the job timeout, so it is skipped unless the photo
+is small (`UPSCALE_TARGET_SIDE`, `UPSCALE_MAX_INPUT_PIXELS`). Since the pipeline no
+longer discards the original resolution, most photos do not need it.
+
+Models are loaded per stage and evicted after (`KEEP_MODELS_LOADED=false`), so peak
+memory is the largest single model rather than the sum of all of them.
+
+## Configuration
+
+Everything in `config.py`, all overridable via environment (see `.env.example`), so a
+container can be retuned without a rebuild. Notably `NUM_THREADS` — onnxruntime and
+OpenCV would otherwise take every core and starve whatever else shares the machine.
+
+## Tests
+
+```bash
+pytest
+```
+
+The suite covers `imaging.py` without needing models or a network. Tests that need real
+photographs (face detection) skip unless you drop some into `tests/fixtures/photos/`.

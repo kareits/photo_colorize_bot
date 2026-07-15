@@ -1,0 +1,24 @@
+# Build-time only — for turning upstream PyTorch weights into ONNX.
+#
+# Nothing here is installed in production. This is the quarantine: torch and its
+# dependents live on this side of the wall so that requirements.txt can stay free
+# of them. See tools/export_onnx.py.
+#
+# Usage:
+#   python -m venv .venv-export
+#   .venv-export/Scripts/pip install -r requirements-export.txt   # Linux: bin/pip
+#   git clone --depth 1 https://github.com/piddnad/DDColor.git vendor_repos/DDColor
+#   git clone --depth 1 https://github.com/wzhouxiff/RestoreFormerPlusPlus.git vendor_repos/RestoreFormerPlusPlus
+#   python -m tools.export_onnx --weights-dir weights --out-dir onnx --repos-dir vendor_repos
+#
+# basicsr is deliberately absent: it was needed only for RRDBNet, and installing it
+# would drag back torchvision<0.17 and Python 3.10. That one class is vendored
+# instead — see tools/vendor/.
+
+torch
+torchvision
+timm<1.0            # ConvNeXt backbone for DDColor; timm 1.0 moved timm.models.layers
+onnx
+onnxruntime
+opencv-python
+huggingface_hub     # DDColor's build helper imports it
