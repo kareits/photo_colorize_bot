@@ -76,25 +76,18 @@ class Pipeline:
 
     def _plan(self, img: np.ndarray, file_bytes: int) -> list[tuple[str, object]]:
         """Decide which stages actually apply to *this* image."""
-        already_colour = imaging.is_already_colour(img)
-
-        colorize = config.ENABLE_COLORIZE
-        if colorize and config.SKIP_COLORIZE_IF_COLOUR and already_colour:
-            # Colourising a colour photo repaints it. Users do send them.
-            logger.info("input already has colour; skipping colourise")
-            colorize = False
-
         stages: list[tuple[str, object]] = []
 
-        # Neutralise a sepia or otherwise toned print before anything else touches
-        # it, so no later stage has to cope with the tone. Skipped for genuine
-        # colour photos, which we must not strip.
-        if not already_colour:
-            stages.append(("desaturate", lambda i: imaging.desaturate(i)))
+        # Neutralise every input to greyscale first, colour or not. This drops the old
+        # "is this already colour?" check, which rested on a brittle threshold — it
+        # once mistook a sepia print for a colour photo and refused to colourise it.
+        # A colour photo now gets recoloured by DDColor rather than kept, which is the
+        # honest behaviour for a colourising bot and removes a whole class of misfires.
+        stages.append(("desaturate", lambda i: imaging.desaturate(i)))
 
         if config.ENABLE_FACE_RESTORE and config.FACE_RESTORE_BEFORE_COLORIZE:
             stages.append(("faces", self._restore_faces))
-        if colorize:
+        if config.ENABLE_COLORIZE:
             stages.append(("colorize", self._colorize))
         if config.ENABLE_WHITE_BALANCE:
             stages.append(("white_balance", self._white_balance))

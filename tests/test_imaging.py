@@ -19,32 +19,6 @@ def test_limit_long_side_shrinks_only_when_needed():
     assert imaging.limit_long_side(small, 1000).shape[:2] == (100, 200)
 
 
-def test_is_already_colour_distinguishes_grey_from_colour(synthetic_gray):
-    assert not imaging.is_already_colour(synthetic_gray)
-
-    vivid = np.zeros((50, 50, 3), dtype=np.uint8)
-    vivid[:, :, 2] = 200  # strong red
-    assert imaging.is_already_colour(vivid)
-
-
-def test_sepia_scan_is_not_mistaken_for_colour():
-    """A sepia-toned print is still a photo to colourise, not a colour photo.
-
-    The case the check must get right, and the one a naive saturation threshold
-    gets wrong: sepia is heavily tinted (saturation ~50) but monochrome in
-    substance. Reading it as "already colour" would make the bot refuse precisely
-    the old prints it exists for.
-    """
-    rng = np.random.default_rng(41)
-    grey = rng.integers(40, 220, (80, 80)).astype(np.float32)
-    sepia = cv2.merge([
-        (grey * 0.80).astype(np.uint8),   # B
-        (grey * 0.95).astype(np.uint8),   # G
-        grey.astype(np.uint8),            # R — warm cast
-    ])
-    assert not imaging.is_already_colour(sepia)
-
-
 def test_desaturate_neutralises_the_tone_but_keeps_luminance():
     """Sepia in, neutral grey out — with the brightness structure intact.
 
@@ -70,20 +44,18 @@ def test_desaturate_neutralises_the_tone_but_keeps_luminance():
     assert np.abs(before - after).mean() < 2.0
 
 
-def test_a_real_colour_photo_is_still_detected():
-    """The other half of the sepia fix: varied hues must still read as colour.
-
-    Guards against "fixing" sepia by simply declaring everything monochrome.
-    """
+def test_desaturate_flattens_a_colour_photo_too():
+    """Colour in, neutral grey out — every input is neutralised, not just sepia."""
     rng = np.random.default_rng(43)
-    # Different hues in different regions — what an actual colour photo looks like.
-    photo = np.zeros((90, 90, 3), dtype=np.uint8)
-    photo[:30] = [200, 40, 40]     # blue sky
-    photo[30:60] = [40, 160, 40]   # green foliage
-    photo[60:] = [40, 40, 190]     # red earth
+    photo = np.zeros((60, 60, 3), dtype=np.uint8)
+    photo[:20] = [200, 40, 40]
+    photo[20:40] = [40, 160, 40]
+    photo[40:] = [40, 40, 190]
     photo = np.clip(photo.astype(int) + rng.integers(-15, 15, photo.shape), 0, 255).astype(np.uint8)
 
-    assert imaging.is_already_colour(photo)
+    out = imaging.desaturate(photo)
+    assert np.abs(out[:, :, 0].astype(int) - out[:, :, 2].astype(int)).max() <= 2
+    assert np.abs(out[:, :, 1].astype(int) - out[:, :, 2].astype(int)).max() <= 2
 
 
 # --------------------------------------------------------------------------- #

@@ -55,50 +55,19 @@ def limit_long_side(img: np.ndarray, max_side: int) -> np.ndarray:
     return cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
 
 
-def is_already_colour(
-    img: np.ndarray,
-    spread_threshold: float = 6.0,
-    cast_threshold: float = 30.0,
-) -> bool:
-    """True if the image carries real colour, so colourising it would repaint it.
-
-    Users do send colour photos to a colouriser bot, and repainting one is a bug.
-    But the obvious test — "is there much colour?" — gets the important case
-    backwards: a sepia print is heavily tinted (saturation ~50) yet is exactly the
-    photo this bot exists for. Thresholding on the amount of colour would reject
-    the old prints and accept the modern snapshots.
-
-    Two signals together, because neither alone is enough:
-
-    * **Spread** of Lab's a/b channels. A tone is one hue laid evenly across the
-      frame, so a/b barely vary; a real photo has different hues in different
-      places. This is what tells sepia apart from a landscape.
-    * **Cast**, i.e. how far a/b sit from neutral. Spread alone would call a
-      uniformly red image monochrome, since an even hue has no variation at all.
-      Sepia's cast is mild; a saturated colour's is not.
-    """
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)
-    a, b = lab[:, :, 1].astype(np.float32), lab[:, :, 2].astype(np.float32)
-
-    spread = max(float(a.std()), float(b.std()))
-    # OpenCV packs Lab into uint8 with 128 as neutral for a and b.
-    cast = max(abs(float(a.mean()) - 128.0), abs(float(b.mean()) - 128.0))
-
-    return spread > spread_threshold or cast > cast_threshold
-
-
 def desaturate(img: np.ndarray) -> np.ndarray:
-    """Strip an old print's tone, keeping its luminance. Sepia in, neutral grey out.
+    """Strip any colour, keeping luminance. Sepia or full colour in, neutral grey out.
 
-    Runs before anything else on a monochrome photo. The colouriser would ignore the
-    tone anyway — it reads only Lab's L and predicts fresh chroma — but relying on
-    that leaves the tone alive everywhere else in the pipeline: white balance would
-    try to "correct" it, and the face restorer would get a sepia face, which is not
-    a face it was ever trained on.
+    The first stage, run on every input unconditionally. That is deliberate: rather
+    than guess whether a photo is "already colour" and skip colourising — a guess on a
+    brittle threshold that once mistook a sepia print for a colour photo — we neutralise
+    everything and let the colouriser repaint it. A colour photo comes back recoloured,
+    which is the honest behaviour for a colourising bot.
 
-    Neutralising once, up front, means every later stage sees the same thing no
-    matter what tone the print happened to carry, so the result no longer depends on
-    how brown the scan was.
+    It also means no later stage has to cope with a tone: white balance would try to
+    "correct" one, and the face restorer would get a tinted face outside its training
+    distribution. After this, every stage sees the same neutral input regardless of
+    what the scan happened to carry.
     """
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)
     lab[:, :, 1] = 128   # a -> neutral

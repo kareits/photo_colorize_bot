@@ -87,9 +87,6 @@ ENABLE_WHITE_BALANCE = _bool("ENABLE_WHITE_BALANCE", False)
 # is nothing next to what upscaling costs.
 COLORIZER_MODEL = os.environ.get("COLORIZER_MODEL", "ddcolor_large.onnx")
 
-# Skip colourising when the photo already has real colour, rather than repainting it.
-SKIP_COLORIZE_IF_COLOUR = _bool("SKIP_COLORIZE_IF_COLOUR", True)
-
 # Stage order. Faces after colourising means the restorer sees a *colour* face,
 # which is the distribution it was trained on — the old pipeline fed it greyscale
 # and got the glassy, over-contrasted eyes that led to the stage being switched
