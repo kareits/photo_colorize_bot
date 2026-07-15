@@ -35,7 +35,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 BASE_DIR = Path(__file__).resolve().parent
 TMP_DIR = Path(os.environ.get("TMP_DIR", BASE_DIR / "tmp"))
 ONNX_DIR = Path(os.environ.get("ONNX_DIR", BASE_DIR / "onnx"))
+# Persistent state (user settings). Deliberately separate from TMP_DIR, which is
+# wiped on startup; DATA_DIR must survive restarts.
+DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 TMP_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Resources ---
 # onnxruntime and OpenCV both grab every core by default. On a box shared with a busy
@@ -65,16 +69,11 @@ MAX_QUEUE_SIZE = _int("MAX_QUEUE_SIZE", 20)
 USER_COOLDOWN_SEC = _int("USER_COOLDOWN_SEC", 5)
 
 # --- Stages ---
+# Whether to colourise at all is a global switch (a colourising bot that does not
+# colourise makes no sense to expose per-user). Upscaling, white balance and
+# face-restoration *strength* are per-user choices now — see settings.py, driven by
+# the /settings presets — so they are not config flags any more.
 ENABLE_COLORIZE = _bool("ENABLE_COLORIZE", True)
-ENABLE_FACE_RESTORE = _bool("ENABLE_FACE_RESTORE", True)
-ENABLE_UPSCALE = _bool("ENABLE_UPSCALE", True)
-
-# Off by default. Side-by-side on real photos it hurt as often as it helped: on a
-# portrait it pushed the background blue and cooled the skin, which reads as *more*
-# saturated by any metric while being less true. Where it does help — an old print
-# with a green-olive cast — it is a per-photo judgement, not something to impose on
-# everyone. Best exposed as a user-facing option later rather than defaulted on.
-ENABLE_WHITE_BALANCE = _bool("ENABLE_WHITE_BALANCE", False)
 
 # Which DDColor export to use: ddcolor_large.onnx | ddcolor_tiny.onnx
 #
@@ -93,13 +92,10 @@ COLORIZER_MODEL = os.environ.get("COLORIZER_MODEL", "ddcolor_large.onnx")
 # off. Set true to restore the old order and compare.
 FACE_RESTORE_BEFORE_COLORIZE = _bool("FACE_RESTORE_BEFORE_COLORIZE", False)
 
-# 0.0 = original, 1.0 = full restoration. Kept low on purpose: RestoreFormer++, like
-# every generative face restorer, redraws eyes that were already fine — at 0.7 the
-# gaze visibly changes and skin goes plastic; at 0.3 it barely helps. 0.5 is the
-# point where it sharpens a soft face without inventing a new one. It only decides
-# how much of the model's output is blended over the original, so the safe failure
-# mode is "looks like the original", not "looks wrong".
-FACE_RESTORE_STRENGTH = _float("FACE_RESTORE_STRENGTH", 0.5)
+# Face restore *strength* moved to settings.py (per-user, 0.5 in both presets). It is
+# a blend factor: RestoreFormer++, like every generative restorer, redraws eyes that
+# were already fine — 0.7 changes the gaze and plastics the skin, 0.3 barely helps,
+# 0.5 sharpens a soft face without inventing a new one.
 
 # Cost is linear in the number of faces — each one is a separate 512x512 pass, about
 # 5 s. A group photo triggered 20 detections and spent 103 s on this stage alone; on

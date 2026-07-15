@@ -22,6 +22,8 @@ services:
       - ./onnx:/app/onnx:ro
       # Scratch space for in/out files; survives restarts, cleared on startup.
       - ./tmp:/app/tmp
+      # Persistent state (user settings) — must survive restarts and redeploys.
+      - ./data:/app/data
 
     # A ceiling, not a reservation. Peak is the largest single model (~1.8 GB during
     # upscale); 3 GB leaves headroom without risking the 3.8 GB box. If the kernel

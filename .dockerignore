@@ -16,6 +16,7 @@ tools/
 
 # Local artefacts.
 tmp/
+data/
 compare_out/
 tests/
 .git/

@@ -29,6 +29,7 @@ from PIL import Image, ImageOps
 import config
 import imaging
 from models import Models
+from settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +38,18 @@ class Pipeline:
     def __init__(self, models: Models):
         self.models = models
 
-    def process(self, in_path: Path, out_path: Path, on_stage=None, deadline: float | None = None) -> Path:
+    def process(
+        self,
+        in_path: Path,
+        out_path: Path,
+        settings: Settings,
+        on_stage=None,
+        deadline: float | None = None,
+    ) -> Path:
         """Run the full pipeline. Blocking and CPU-heavy — call it off the event loop.
+
+        settings carries the per-user choices (which the bot resolves from a preset);
+        operational parameters stay in config.
 
         on_stage(name, index, total) is called before each stage so the bot can show
         progress; a minute of silence feels broken.
@@ -52,7 +63,7 @@ class Pipeline:
         img = self._load(in_path)
         img = imaging.limit_long_side(img, config.MAX_INPUT_SIDE)
 
-        stages = self._plan(img, in_path.stat().st_size)
+        stages = self._plan(img, in_path.stat().st_size, settings)
         for index, (name, run) in enumerate(stages, start=1):
             if deadline is not None and time.monotonic() > deadline:
                 raise TimeoutError(f"ran out of time before stage '{name}'")
@@ -74,9 +85,14 @@ class Pipeline:
             raise RuntimeError(f"could not write the result to {out_path}")
         return out_path
 
-    def _plan(self, img: np.ndarray, file_bytes: int) -> list[tuple[str, object]]:
-        """Decide which stages actually apply to *this* image."""
+    def _plan(self, img: np.ndarray, file_bytes: int, settings: Settings) -> list[tuple[str, object]]:
+        """Decide which stages actually apply to *this* image and these settings."""
         stages: list[tuple[str, object]] = []
+
+        restore_faces = settings.face_restore_strength > 0.0
+
+        def faces(i: np.ndarray) -> np.ndarray:
+            return self._restore_faces(i, settings.face_restore_strength)
 
         # Neutralise every input to greyscale first, colour or not. This drops the old
         # "is this already colour?" check, which rested on a brittle threshold — it
@@ -85,15 +101,15 @@ class Pipeline:
         # honest behaviour for a colourising bot and removes a whole class of misfires.
         stages.append(("desaturate", lambda i: imaging.desaturate(i)))
 
-        if config.ENABLE_FACE_RESTORE and config.FACE_RESTORE_BEFORE_COLORIZE:
-            stages.append(("faces", self._restore_faces))
+        if restore_faces and config.FACE_RESTORE_BEFORE_COLORIZE:
+            stages.append(("faces", faces))
         if config.ENABLE_COLORIZE:
             stages.append(("colorize", self._colorize))
-        if config.ENABLE_WHITE_BALANCE:
+        if settings.white_balance:
             stages.append(("white_balance", self._white_balance))
-        if config.ENABLE_FACE_RESTORE and not config.FACE_RESTORE_BEFORE_COLORIZE:
-            stages.append(("faces", self._restore_faces))
-        if config.ENABLE_UPSCALE and self._worth_upscaling(img, file_bytes):
+        if restore_faces and not config.FACE_RESTORE_BEFORE_COLORIZE:
+            stages.append(("faces", faces))
+        if settings.upscale and self._worth_upscaling(img, file_bytes):
             stages.append(("upscale", self._upscale))
         return stages
 
@@ -150,13 +166,12 @@ class Pipeline:
             img, strength=config.WHITE_BALANCE_STRENGTH, norm=config.WHITE_BALANCE_NORM
         )
 
-    def _restore_faces(self, img: np.ndarray) -> np.ndarray:
+    def _restore_faces(self, img: np.ndarray, strength: float) -> np.ndarray:
         faces = self.models.face_detector.detect(img, max_faces=config.MAX_FACES)
         if not faces:
             logger.info("no faces found; leaving the image alone")
             return img
 
-        strength = config.FACE_RESTORE_STRENGTH
         out = img
         for landmarks in faces:
             try:

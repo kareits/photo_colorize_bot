@@ -21,12 +21,20 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramUnauthorizedError
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BufferedInputFile, FSInputFile, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from PIL import Image
 
 import config
 from models import Models, configure_threads
 from pipeline import Pipeline
+from settings import PRESET_LABELS, PRESETS, SettingsStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +59,7 @@ Image.MAX_IMAGE_PIXELS = config.MAX_INPUT_PIXELS
 
 _models: Models | None = None
 _pipeline: Pipeline | None = None
+_settings = SettingsStore(config.DATA_DIR / "settings.json")
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pipeline")
 
 # Jobs queued or running. Guarded by the event loop being single-threaded: every
@@ -132,14 +141,51 @@ async def on_help(message: Message):
         "Что я делаю с фотографией:\n"
         "1. Убираю жёлтый налёт старого отпечатка\n"
         "2. Раскрашиваю (нейросеть DDColor)\n"
-        "3. Выравниваю цвета\n"
-        "4. Восстанавливаю лица (RestoreFormer++)\n"
-        "5. Повышаю разрешение, если фото маленькое\n\n"
+        "3. Восстанавливаю лица (RestoreFormer++)\n"
+        "4. Повышаю разрешение, если фото маленькое\n\n"
         f"Ограничения: до {config.MAX_UPLOAD_MB} МБ, "
         f"до {config.MAX_INPUT_PIXELS / 1e6:.0f} Мпикс.\n"
-        "Обработка занимает от 30 секунд до пары минут — фото обрабатываются по очереди.\n\n"
+        "Режим обработки — команда /settings.\n\n"
         "Отправляйте <b>файлом</b>, чтобы Telegram не сжимал фото."
     , parse_mode="HTML")
+
+
+def _settings_keyboard(active: str) -> InlineKeyboardMarkup:
+    """Preset buttons, with a check mark on the one currently in effect."""
+    row = [
+        InlineKeyboardButton(
+            text=("✓ " if name == active else "") + PRESET_LABELS[name],
+            callback_data=f"preset:{name}",
+        )
+        for name in PRESETS
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
+@router.message(Command("settings"))
+async def on_settings(message: Message):
+    active = _settings.preset_name(message.from_user.id)
+    await message.answer(
+        "Режим обработки:\n\n"
+        "⚡ <b>Скорость</b> — раскрашивание и лица, без апскейла. ~10–20 секунд.\n"
+        "💎 <b>Качество</b> — то же плюс повышение разрешения для мелких фото. Дольше.",
+        reply_markup=_settings_keyboard(active),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("preset:"))
+async def on_preset_chosen(callback: CallbackQuery):
+    preset = callback.data.split(":", 1)[1]
+    if preset not in PRESETS:
+        await callback.answer("Неизвестный режим.")
+        return
+
+    _settings.set_preset(callback.from_user.id, preset)
+    await callback.answer(f"Режим: {PRESET_LABELS[preset]}")
+    # Re-render so the check mark moves to the chosen preset.
+    with contextlib.suppress(Exception):
+        await callback.message.edit_reply_markup(reply_markup=_settings_keyboard(preset))
 
 
 @router.message(F.photo)
@@ -212,6 +258,8 @@ async def _handle(message: Message, file, suffix: str, original_name: str | None
             _edit(status, f"{text}… ({index}/{total})"), loop
         )
 
+    settings = _settings.settings_for(user_id)
+
     try:
         await message.bot.download(file, destination=in_path)
         _check_decoded_size(in_path)
@@ -221,7 +269,8 @@ async def _handle(message: Message, file, suffix: str, original_name: str | None
 
         await asyncio.wait_for(
             loop.run_in_executor(
-                _executor, lambda: _pipeline.process(in_path, out_path, report, deadline)
+                _executor,
+                lambda: _pipeline.process(in_path, out_path, settings, report, deadline),
             ),
             # A little slack over the pipeline's own deadline: let it stop itself
             # cleanly rather than abandoning a thread that keeps running regardless.

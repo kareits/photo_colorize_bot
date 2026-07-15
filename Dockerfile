@@ -23,8 +23,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py ./
 
-# tmp/ is where in/out files live mid-job; onnx/ is the mounted model volume.
-RUN mkdir -p tmp onnx
+# tmp/ holds in/out files mid-job; onnx/ is the mounted model volume; data/ is the
+# mounted volume for persistent state (user settings).
+RUN mkdir -p tmp onnx data
 
 # Unbuffered so logs reach docker as they happen, not in blocks.
 ENV PYTHONUNBUFFERED=1
