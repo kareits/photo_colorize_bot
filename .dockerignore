@@ -1,0 +1,28 @@
+# The image carries code and requirements.txt only. Everything heavy or local is
+# built, mounted, or generated elsewhere.
+
+# Virtualenvs — the image builds its own.
+.venv*/
+venv/
+
+# Models: mounted as a volume, not baked in.
+onnx/
+weights/
+
+# Build-time only, and huge.
+vendor_repos/
+requirements-export.txt
+tools/
+
+# Local artefacts.
+tmp/
+compare_out/
+tests/
+.git/
+.gitignore
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Secrets never go into an image layer.
+.env

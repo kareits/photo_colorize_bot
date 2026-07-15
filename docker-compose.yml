@@ -1,0 +1,30 @@
+# Standalone compose project. It shares nothing with the TTS service on the box —
+# separate directory, separate file — so bringing this up or down cannot touch it.
+# The bot needs no ports: it polls Telegram, nothing connects in.
+
+services:
+  colorize-bot:
+    build: .
+    image: colorize-bot
+    container_name: colorize-bot
+    restart: unless-stopped
+
+    env_file: .env
+    environment:
+      # Kept in step with NUM_THREADS. The server's 4 cores, with an idle TTS
+      # neighbour; drop both if that stops being true.
+      NUM_THREADS: 4
+      OMP_NUM_THREADS: 4
+
+    volumes:
+      # Models live outside the image — copy them here once with scp, e.g.
+      #   scp onnx/*.onnx isoyle:~/colorize-bot/onnx/
+      - ./onnx:/app/onnx:ro
+      # Scratch space for in/out files; survives restarts, cleared on startup.
+      - ./tmp:/app/tmp
+
+    # A ceiling, not a reservation. Peak is the largest single model (~1.8 GB during
+    # upscale); 3 GB leaves headroom without risking the 3.8 GB box. If the kernel
+    # OOM-kills at this limit it kills the bot, never the neighbour.
+    mem_limit: 3g
+    cpus: 4.0
