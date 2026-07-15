@@ -6,8 +6,10 @@ free of both.
 import cv2
 import numpy as np
 import pytest
+from PIL import Image
 
 import imaging
+from pipeline import Pipeline
 
 
 def test_limit_long_side_shrinks_only_when_needed():
@@ -263,3 +265,31 @@ def test_upscale_tiled_is_seamless(tile):
     assert out.shape == expected.shape
     # Allow 1 unit for the uint8 <-> float round trip, but no seams.
     assert np.abs(out.astype(int) - expected.astype(int)).max() <= 1
+
+
+# --------------------------------------------------------------------------- #
+# HEIC.
+# --------------------------------------------------------------------------- #
+def test_pipeline_loads_heic(tmp_path):
+    """HEIC is what iPhones shoot by default and OpenCV cannot read it.
+
+    _load must fall through to Pillow (with pillow-heif registered in imaging). If
+    the opener were not registered, or the fallback missing, this raises.
+    """
+    rgb = np.zeros((120, 80, 3), dtype=np.uint8)
+    rgb[:, :, 0] = np.linspace(20, 200, 80, dtype=np.uint8)[None, :]
+    heic = tmp_path / "photo.heic"
+    Image.fromarray(rgb).save(heic, format="HEIF")
+
+    # OpenCV alone cannot — this is the reason the fallback exists.
+    assert cv2.imread(str(heic)) is None
+
+    img = Pipeline._load(heic)
+    assert img.shape == (120, 80, 3)
+
+
+def test_load_raises_on_a_non_image(tmp_path):
+    junk = tmp_path / "notimage.png"
+    junk.write_bytes(b"definitely not an image")
+    with pytest.raises(ValueError):
+        Pipeline._load(junk)

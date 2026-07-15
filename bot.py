@@ -34,7 +34,15 @@ from PIL import Image
 import config
 from models import Models, configure_threads
 from pipeline import Pipeline
-from settings import PRESET_LABELS, PRESETS, SettingsStore
+from settings import (
+    FACE_LABELS,
+    PRESET_LABELS,
+    PRESETS,
+    Settings,
+    SettingsStore,
+    matching_preset,
+    next_face_level,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -150,27 +158,50 @@ async def on_help(message: Message):
     , parse_mode="HTML")
 
 
-def _settings_keyboard(active: str) -> InlineKeyboardMarkup:
-    """Preset buttons, with a check mark on the one currently in effect."""
-    row = [
+_SETTINGS_TEXT = (
+    "Режим обработки:\n\n"
+    "⚡ <b>Скорость</b> — раскрашивание и лица, без апскейла. ~10–20 секунд.\n"
+    "💎 <b>Качество</b> — то же плюс повышение разрешения для мелких фото. Дольше.\n\n"
+    "⚙️ <b>Продвинутые</b> — включить/выключить стадии по отдельности."
+)
+
+
+def _main_keyboard(settings: Settings) -> InlineKeyboardMarkup:
+    """Preset buttons, with a check mark on the preset in effect (none if custom)."""
+    active = matching_preset(settings)
+    presets = [
         InlineKeyboardButton(
             text=("✓ " if name == active else "") + PRESET_LABELS[name],
             callback_data=f"preset:{name}",
         )
         for name in PRESETS
     ]
-    return InlineKeyboardMarkup(inline_keyboard=[row])
+    advanced = InlineKeyboardButton(text="⚙️ Продвинутые", callback_data="adv:open")
+    return InlineKeyboardMarkup(inline_keyboard=[presets, [advanced]])
+
+
+def _advanced_keyboard(s: Settings) -> InlineKeyboardMarkup:
+    """One button per tunable; tapping it cycles/toggles that field."""
+    on_off = {True: "✅", False: "❌"}
+    rows = [
+        [InlineKeyboardButton(text=f"Апскейл: {on_off[s.upscale]}", callback_data="adv:upscale")],
+        [InlineKeyboardButton(
+            text=f"Лица: {FACE_LABELS.get(s.face_restore_strength, s.face_restore_strength)}",
+            callback_data="adv:faces",
+        )],
+        [InlineKeyboardButton(
+            text=f"Баланс белого: {on_off[s.white_balance]}", callback_data="adv:wb"
+        )],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="adv:back")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.message(Command("settings"))
 async def on_settings(message: Message):
-    active = _settings.preset_name(message.from_user.id)
+    settings = _settings.settings_for(message.from_user.id)
     await message.answer(
-        "Режим обработки:\n\n"
-        "⚡ <b>Скорость</b> — раскрашивание и лица, без апскейла. ~10–20 секунд.\n"
-        "💎 <b>Качество</b> — то же плюс повышение разрешения для мелких фото. Дольше.",
-        reply_markup=_settings_keyboard(active),
-        parse_mode="HTML",
+        _SETTINGS_TEXT, reply_markup=_main_keyboard(settings), parse_mode="HTML"
     )
 
 
@@ -181,11 +212,54 @@ async def on_preset_chosen(callback: CallbackQuery):
         await callback.answer("Неизвестный режим.")
         return
 
-    _settings.set_preset(callback.from_user.id, preset)
+    settings = PRESETS[preset]
+    _settings.save(callback.from_user.id, settings)
     await callback.answer(f"Режим: {PRESET_LABELS[preset]}")
-    # Re-render so the check mark moves to the chosen preset.
     with contextlib.suppress(Exception):
-        await callback.message.edit_reply_markup(reply_markup=_settings_keyboard(preset))
+        await callback.message.edit_reply_markup(reply_markup=_main_keyboard(settings))
+
+
+@router.callback_query(F.data.startswith("adv:"))
+async def on_advanced(callback: CallbackQuery):
+    action = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+
+    if action == "open":
+        settings = _settings.settings_for(user_id)
+        await callback.answer()
+        with contextlib.suppress(Exception):
+            await callback.message.edit_text(
+                "Продвинутые настройки. Нажмите, чтобы изменить:",
+                reply_markup=_advanced_keyboard(settings),
+            )
+        return
+
+    if action == "back":
+        settings = _settings.settings_for(user_id)
+        await callback.answer()
+        with contextlib.suppress(Exception):
+            await callback.message.edit_text(
+                _SETTINGS_TEXT, reply_markup=_main_keyboard(settings), parse_mode="HTML"
+            )
+        return
+
+    # A toggle: change one field, persist, re-render the advanced screen.
+    if action == "upscale":
+        settings = _settings.update(user_id, upscale=not _settings.settings_for(user_id).upscale)
+    elif action == "wb":
+        settings = _settings.update(
+            user_id, white_balance=not _settings.settings_for(user_id).white_balance
+        )
+    elif action == "faces":
+        current = _settings.settings_for(user_id).face_restore_strength
+        settings = _settings.update(user_id, face_restore_strength=next_face_level(current))
+    else:
+        await callback.answer("Неизвестная настройка.")
+        return
+
+    await callback.answer()
+    with contextlib.suppress(Exception):
+        await callback.message.edit_reply_markup(reply_markup=_advanced_keyboard(settings))
 
 
 @router.message(F.photo)
