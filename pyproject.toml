@@ -1,0 +1,14 @@
+[project]
+name = "photo-colorize-bot"
+version = "0.2.0"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    # Tests that need real photographs in tests/fixtures/photos/.
+    # Without them they skip: a face detector sees nothing in synthetic input.
+    "needs_photos: requires real photos in tests/fixtures/photos/",
+    # Tests that need the exported .onnx models (produced in phase 1).
+    "needs_onnx: requires exported models in onnx/",
+]

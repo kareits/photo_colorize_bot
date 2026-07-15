@@ -1,21 +1,39 @@
-# ── Секреты ──────────────────────────────────────────────
+# ── Secrets ──────────────────────────────────────────────
 .env
 .env.*
 !.env.example
 
-# ── Виртуальные окружения ────────────────────────────────
+# ── Virtual environments ─────────────────────────────────
+# .venv-export (torch, build-time) and .venv-run (torch-free runtime) are kept
+# separate on purpose — that separation is the architecture.
 venv/
-.venv/
+.venv*/
 env/
 
-# ── Веса моделей и временные файлы ───────────────────────
-# Большие файлы, качаются автоматически при первом запуске — в git не нужны.
+# Upstream repos cloned only to export ONNX (tools/export_onnx.py). Build-time
+# scaffolding, not our source.
+vendor_repos/
+
+# ── Model weights and scratch files ──────────────────────
+# Large, downloaded on first run — no reason to keep them in git.
 weights/
 tmp/
 
-# Локальные папки, куда библиотеки скачивают веса при работе:
+# Exported ONNX models: built from the weights by tools/export_onnx.py
+# (in Docker, on the build stage). Gigabytes — they do not belong in git.
+onnx/
+
+# Directories the upstream libraries download weights into:
 gfpgan/
 realesrgan/
+
+# ── Photo fixtures ───────────────────────────────────────
+# Other people's photographs stay out of the repo — only the README is tracked.
+tests/fixtures/photos/*
+!tests/fixtures/photos/README.md
+
+# Quality comparison output (the phase-5 contact sheets).
+compare_out/
 
 # ── Python ───────────────────────────────────────────────
 __pycache__/
@@ -23,10 +41,10 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# ── Логи ─────────────────────────────────────────────────
+# ── Logs ─────────────────────────────────────────────────
 *.log
 
-# ── Редакторы / ОС ───────────────────────────────────────
+# ── Editors / OS ─────────────────────────────────────────
 .vscode/
 .idea/
 .DS_Store

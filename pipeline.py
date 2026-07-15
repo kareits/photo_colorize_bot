@@ -1,204 +1,200 @@
-"""
-Пайплайн обработки фото на CPU.
+"""Stage orchestration. Decides what runs, in what order, and on what.
 
-Порядок стадий (важен!):
-  1. Реставрация лиц  — GFPGAN        (Apache-2.0)
-  2. Раскрашивание    — DDColor       (Apache-2.0, через modelscope)
-  3. Апскейл          — Real-ESRGAN   (BSD-3)
+Pure orchestration: the pixel work lives in imaging.py and the sessions in
+models.py. No torch anywhere in this process — see tools/export_onnx.py for the
+one place it is allowed.
 
-Между стадиями изображение живёт как BGR uint8 ndarray (формат OpenCV).
-Модели грузятся лениво. При SEQUENTIAL_MODEL_LOADING=True каждая стадия
-выгружает свою модель после работы, чтобы не держать всё в памяти разом.
+The order below is the substance of the refactor:
+
+    original (full resolution)
+      -> colourise    DDColor predicts ab at 512; the original full-resolution L
+                      is kept verbatim and only ab is upsampled onto it
+      -> white balance
+      -> restore faces  after colourising, so the restorer sees a colour face
+      -> upscale        only if the result is still small
+
+The old pipeline shrank the input to 768, restored faces on a *greyscale* image,
+and then leaned on Real-ESRGAN to invent back the detail it had just discarded.
 """
-import gc
+from __future__ import annotations
+
 import logging
+import time
+from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
+from PIL import Image, ImageOps
 
 import config
+import imaging
+from models import Models
 
 logger = logging.getLogger(__name__)
 
-# CPU-режим жёстко: никаких попыток уехать на GPU.
-torch.set_grad_enabled(False)
-_DEVICE = torch.device("cpu")
 
+class Pipeline:
+    def __init__(self, models: Models):
+        self.models = models
 
-class RestorePipeline:
-    def __init__(self):
-        self._gfpgan = None
-        self._colorizer = None
-        self._upsampler = None
+    def process(self, in_path: Path, out_path: Path, on_stage=None, deadline: float | None = None) -> Path:
+        """Run the full pipeline. Blocking and CPU-heavy — call it off the event loop.
 
-    # ------------------------------------------------------------------ #
-    # Публичный метод: полный прогон одного файла.
-    # Блокирующий и CPU-тяжёлый — в боте вызывается в отдельном потоке.
-    # ------------------------------------------------------------------ #
-    def process(self, in_path, out_path):
-        img = self._load_bgr(in_path)
-        img = self._limit_size(img, config.MAX_INPUT_SIDE)
+        on_stage(name, index, total) is called before each stage so the bot can show
+        progress; a minute of silence feels broken.
 
-        if config.ENABLE_FACE_RESTORE:
-            img = self._stage(self._restore_faces, img, name="face_restore")
-        if config.ENABLE_COLORIZE:
-            img = self._stage(self._colorize, img, name="colorize")
-        if config.ENABLE_AUTO_WHITE_BALANCE:
-            img = self._stage(self._auto_white_balance, img, name="white_balance")
-        if config.ENABLE_UPSCALE:
-            img = self._stage(self._upscale, img, name="upscale")
+        deadline is a time.monotonic() value past which we give up. It is checked here,
+        between stages, rather than left to the caller — asyncio.wait_for around a
+        thread-pool job does *not* stop the thread, so a runaway image would keep
+        burning CPU and holding the only worker long after the user was told it failed.
+        Cooperative checks are the only way to actually stop.
+        """
+        img = self._load(in_path)
+        img = imaging.limit_long_side(img, config.MAX_INPUT_SIDE)
 
-        cv2.imwrite(str(out_path), img)
+        stages = self._plan(img, in_path.stat().st_size)
+        for index, (name, run) in enumerate(stages, start=1):
+            if deadline is not None and time.monotonic() > deadline:
+                raise TimeoutError(f"ran out of time before stage '{name}'")
+            if on_stage:
+                on_stage(name, index, len(stages))
+
+            started = time.monotonic()
+            before = img.shape[:2]
+            img = run(img)
+            # Free this stage's model before the next one loads its own, so peak
+            # memory is the largest single model rather than the sum of all three.
+            self.models.end_of_stage()
+            logger.info(
+                "stage %s: %sx%s -> %sx%s in %.1fs",
+                name, before[1], before[0], img.shape[1], img.shape[0], time.monotonic() - started,
+            )
+
+        if not cv2.imwrite(str(out_path), img):
+            raise RuntimeError(f"could not write the result to {out_path}")
         return out_path
 
-    # ------------------------------------------------------------------ #
-    # Обёртка стадии: логирование + опциональная выгрузка модели после.
-    # ------------------------------------------------------------------ #
-    def _stage(self, fn, img, name):
-        logger.info("Стадия %s: старт (вход %sx%s)", name, img.shape[1], img.shape[0])
-        out = fn(img)
-        if config.SEQUENTIAL_MODEL_LOADING:
-            self._release_all()
-        logger.info("Стадия %s: готово (выход %sx%s)", name, out.shape[1], out.shape[0])
-        return out
+    def _plan(self, img: np.ndarray, file_bytes: int) -> list[tuple[str, object]]:
+        """Decide which stages actually apply to *this* image."""
+        already_colour = imaging.is_already_colour(img)
 
-    # ------------------------------------------------------------------ #
-    # Вспомогательное: загрузка и нормализация входа.
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _load_bgr(path):
-        img = cv2.imread(str(path), cv2.IMREAD_COLOR)  # всегда 3 канала BGR
-        if img is None:
-            raise ValueError(f"Не удалось прочитать изображение: {path}")
-        return img
+        colorize = config.ENABLE_COLORIZE
+        if colorize and config.SKIP_COLORIZE_IF_COLOUR and already_colour:
+            # Colourising a colour photo repaints it. Users do send them.
+            logger.info("input already has colour; skipping colourise")
+            colorize = False
+
+        stages: list[tuple[str, object]] = []
+
+        # Neutralise a sepia or otherwise toned print before anything else touches
+        # it, so no later stage has to cope with the tone. Skipped for genuine
+        # colour photos, which we must not strip.
+        if not already_colour:
+            stages.append(("desaturate", lambda i: imaging.desaturate(i)))
+
+        if config.ENABLE_FACE_RESTORE and config.FACE_RESTORE_BEFORE_COLORIZE:
+            stages.append(("faces", self._restore_faces))
+        if colorize:
+            stages.append(("colorize", self._colorize))
+        if config.ENABLE_WHITE_BALANCE:
+            stages.append(("white_balance", self._white_balance))
+        if config.ENABLE_FACE_RESTORE and not config.FACE_RESTORE_BEFORE_COLORIZE:
+            stages.append(("faces", self._restore_faces))
+        if config.ENABLE_UPSCALE and self._worth_upscaling(img, file_bytes):
+            stages.append(("upscale", self._upscale))
+        return stages
 
     @staticmethod
-    def _limit_size(img, max_side):
+    def _worth_upscaling(img: np.ndarray, file_bytes: int) -> bool:
+        """Upscale small files only, and never when it would take minutes.
+
+        File size is the signal: a small file means a small or heavily compressed
+        photo, which is what upscaling actually helps. A large one is already detailed.
+
+        The area check is a safety net rather than a nicety — file size does not bound
+        the work. At ~27 s per output megapixel, a compact-but-large scan would run
+        past the job timeout with the only worker pinned.
+        """
         h, w = img.shape[:2]
-        long_side = max(h, w)
-        if long_side <= max_side:
-            return img
-        scale = max_side / long_side
-        new_w, new_h = int(round(w * scale)), int(round(h * scale))
-        return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    # ------------------------------------------------------------------ #
-    # Стадия 1: реставрация лиц (GFPGAN).
-    # ------------------------------------------------------------------ #
-    def _restore_faces(self, img):
-        gfpgan = self._get_gfpgan()
-        # upscale=1: апскейлом займётся Real-ESRGAN в самом конце.
-        _, _, restored = gfpgan.enhance(
-            img,
-            has_aligned=False,
-            only_center_face=False,
-            paste_back=True,
+        if file_bytes >= config.UPSCALE_MAX_FILE_BYTES:
+            logger.info("skipping upscale: %.1f MB file is already detailed", file_bytes / 1e6)
+            return False
+
+        if h * w > config.UPSCALE_MAX_INPUT_PIXELS:
+            logger.info("skipping upscale: %dx%d would take too long", w, h)
+            return False
+
+        return True
+
+    @staticmethod
+    def _load(path: Path) -> np.ndarray:
+        # IMREAD_COLOR gives 3-channel BGR and honours EXIF orientation, so phone
+        # photos do not come out rotated.
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if img is not None:
+            return img
+
+        # OpenCV cannot read HEIC/HEIF — the format iPhones shoot by default, so this
+        # is a common case rather than an exotic one. Pillow can, via pillow-heif
+        # (registered in imaging), but it does not apply EXIF rotation on its own, so
+        # do that explicitly or portrait photos arrive sideways.
+        try:
+            with Image.open(path) as im:
+                im = ImageOps.exif_transpose(im).convert("RGB")
+                return cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+        except Exception as exc:
+            raise ValueError(f"could not read the image: {path}") from exc
+
+    # ---------------------------------------------------------------- stages --
+    def _colorize(self, img: np.ndarray) -> np.ndarray:
+        tensor = imaging.colorize_input(img)
+        ab = self.models.colorizer.run(tensor)
+        return imaging.colorize_output(img, ab)
+
+    def _white_balance(self, img: np.ndarray) -> np.ndarray:
+        return imaging.white_balance(
+            img, strength=config.WHITE_BALANCE_STRENGTH, norm=config.WHITE_BALANCE_NORM
         )
-        if restored is None:
+
+    def _restore_faces(self, img: np.ndarray) -> np.ndarray:
+        faces = self.models.face_detector.detect(img, max_faces=config.MAX_FACES)
+        if not faces:
+            logger.info("no faces found; leaving the image alone")
             return img
 
         strength = config.FACE_RESTORE_STRENGTH
-        if strength >= 0.999:
-            return restored
+        out = img
+        for landmarks in faces:
+            try:
+                crop, matrix = imaging.align_face(out, landmarks)
+            except ValueError:
+                # A face too distorted to align is a face we leave untouched,
+                # rather than pasting a mangled crop over the photo.
+                logger.warning("could not align a face; skipping it")
+                continue
 
-        # Подмешиваем оригинал, чтобы убрать пере-резкость GFPGAN
-        # ("стеклянные"/контрастные глаза). strength=0.5 — половина эффекта.
-        if restored.shape != img.shape:
-            restored = cv2.resize(restored, (img.shape[1], img.shape[0]))
-        return cv2.addWeighted(restored, strength, img, 1.0 - strength, 0.0)
-
-    def _get_gfpgan(self):
-        if self._gfpgan is None:
-            from gfpgan import GFPGANer  # импорт здесь — чтобы тяжёлые либы грузились лениво
-            logger.info("Загружаю GFPGAN...")
-            self._gfpgan = GFPGANer(
-                model_path=config.GFPGAN_MODEL_URL,  # скачается и закэшируется при первом запуске
-                upscale=1,
-                arch="clean",
-                channel_multiplier=2,
-                bg_upsampler=None,
-                device=_DEVICE,
+            restored = imaging.face_restore_output(
+                self.models.face_restorer.run(imaging.face_restore_input(crop))
             )
-        return self._gfpgan
+            if strength < 1.0:
+                restored = cv2.addWeighted(restored, strength, crop, 1.0 - strength, 0.0)
 
-    # ------------------------------------------------------------------ #
-    # Стадия 2: раскрашивание (DDColor через modelscope).
-    # ------------------------------------------------------------------ #
-    def _colorize(self, img):
-        colorizer = self._get_colorizer()
-        from modelscope.outputs import OutputKeys
-        result = colorizer(img)              # принимает BGR ndarray
-        out = result[OutputKeys.OUTPUT_IMG]  # BGR uint8 ndarray
-        return np.ascontiguousarray(out)
+            out = imaging.paste_face(out, restored, matrix)
 
-    def _get_colorizer(self):
-        if self._colorizer is None:
-            from modelscope.pipelines import pipeline
-            from modelscope.utils.constant import Tasks
-            logger.info("Загружаю DDColor (modelscope)...")
-            self._colorizer = pipeline(
-                Tasks.image_colorization,
-                model=config.DDCOLOR_MODELSCOPE_ID,
-                device="cpu",
-            )
-        return self._colorizer
-
-    # ------------------------------------------------------------------ #
-    # Постобработка: авто-баланс белого ("серый мир").
-    # Предполагаем, что средний цвет сцены должен быть нейтрально-серым,
-    # и масштабируем каналы так, чтобы убрать общий цветовой сдвиг.
-    # Модели не требует — чистый numpy.
-    # ------------------------------------------------------------------ #
-    def _auto_white_balance(self, img):
-        strength = config.AUTO_WHITE_BALANCE_STRENGTH
-        if strength <= 0.001:
-            return img
-
-        f = img.astype(np.float32)
-        means = f.reshape(-1, 3).mean(axis=0)          # средние по каналам [B, G, R]
-        gray = float(means.mean())
-        scales = gray / np.clip(means, 1e-6, None)     # коэффициенты к серому
-        corrected = f * scales                         # broadcast по каналам
-
-        # Смешиваем с оригиналом по силе, чтобы коррекцию можно было ослабить.
-        out = f * (1.0 - strength) + corrected * strength
-        return np.clip(out, 0, 255).astype(np.uint8)
-
-    # ------------------------------------------------------------------ #
-    # Стадия 3: апскейл (Real-ESRGAN x2).
-    # ------------------------------------------------------------------ #
-    def _upscale(self, img):
-        upsampler = self._get_upsampler()
-        out, _ = upsampler.enhance(img, outscale=config.UPSCALE_FACTOR)
+        logger.info("restored %d face(s)", len(faces))
         return out
 
-    def _get_upsampler(self):
-        if self._upsampler is None:
-            from basicsr.archs.rrdbnet_arch import RRDBNet
-            from realesrgan import RealESRGANer
-            logger.info("Загружаю Real-ESRGAN...")
-            arch = RRDBNet(
-                num_in_ch=3, num_out_ch=3, num_feat=64,
-                num_block=23, num_grow_ch=32, scale=2,
-            )
-            self._upsampler = RealESRGANer(
-                scale=2,
-                model_path=config.REALESRGAN_MODEL_URL,  # скачается при первом запуске
-                model=arch,
-                tile=config.REALESRGAN_TILE,
-                tile_pad=10,
-                pre_pad=0,
-                half=False,          # на CPU только full precision
-                device=_DEVICE,
-            )
-        return self._upsampler
+    def _upscale(self, img: np.ndarray) -> np.ndarray:
+        native = config.UPSCALER_NATIVE_SCALE
+        out = imaging.upscale_tiled(
+            img, run=self.models.upscaler.run, tile=config.UPSCALE_TILE, scale=native
+        )
 
-    # ------------------------------------------------------------------ #
-    # Выгрузка моделей (режим экономии памяти).
-    # ------------------------------------------------------------------ #
-    def _release_all(self):
-        self._gfpgan = None
-        self._colorizer = None
-        self._upsampler = None
-        gc.collect()
+        # The compact model only comes at x4, but we always want x2, so resample back
+        # down. That supersamples rather than discards — the extra detail is averaged
+        # in, not thrown away.
+        if native != 2:
+            h, w = img.shape[:2]
+            out = cv2.resize(out, (w * 2, h * 2), interpolation=cv2.INTER_AREA)
+        return out
